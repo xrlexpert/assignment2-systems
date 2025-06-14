@@ -2,6 +2,7 @@ import unittest
 import pandas as pd
 from cs336_systems.benchmark_script import run_forward_step, run_backward_step, benchmark
 from cs336_basics.model import BasicsTransformerLM
+import torch
 
 TESTS = {
     "small": {
@@ -90,6 +91,10 @@ class TestBenchmark(unittest.TestCase):
                 "Forward Average Time (ms)": sum(forward_times) / len(forward_times) * 1000,
                 "Backward Average Time (ms)": sum(backward_times) / len(backward_times) * 1000
             })
+            
+            # Clear GPU memory after each model test
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         df = pd.DataFrame(results)
         print(df.to_latex(index=False))
