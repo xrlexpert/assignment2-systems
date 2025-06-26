@@ -49,28 +49,31 @@ class FlashAttentionPytorch(torch.autograd.Function):
                 V_tile = V[:, k_start:k_end, :].to(dtype_acc)
                
                 # (B, q_tile_size, k_tile_size)
-                S_ij = Q_tile @ K_tile.transpose(-2, -1) * scale
+                s_ij = Q_tile @ K_tile.transpose(-2, -1) * scale
+                if is_causal:
+                    mask = torch.triu(torch.ones(q_tile_size, k_tile_size, dtype=torch.bool, device=Q.device), diagonal=1)
+                    s_ij.masked_fill_(mask, -torch.inf)
                 
                 m_iprev = m_i
-                m_i = torch.maximum(m_iprev, torch.max(S_ij, dim=-1)[0])
+                m_i = torch.maximum(m_iprev, torch.max(s_ij, dim=-1)[0])
                 
-                # 注意有关m_i都需要detach，因为不需要梯度传递到m_i
-                p_ij = torch.exp(S_ij - m_i.detach().unsqueeze(-1))
+                # We use .detach() to prevent gradients from flowing back through m_i and m_iprev.
+                p_ij = torch.exp(s_ij - m_i.detach().unsqueeze(-1))
 
-                l_scale = torch.exp(m_iprev.detach() - m_i.detach())
+                l_scale_factor = torch.exp(m_iprev.detach() - m_i.detach())
 
-                l_i = l_scale * l_i + torch.sum(p_ij, dim=-1)
+                l_i = l_scale_factor * l_i + torch.sum(p_ij, dim=-1)
 
-                O_i =  rearrange(l_scale, 'b q -> b q 1') * O_i + (p_ij @ V_tile)
+                O_i =  rearrange(l_scale_factor, 'b q -> b q 1') * O_i + (p_ij @ V_tile)
             
             l_i_safe = l_i + 1e-6
 
             O_i_final = O_i * rearrange(1.0 / l_i_safe, 'b q -> b q 1')
 
-            L_i_final = m_i + torch.log(l_i_safe)
+            logsumexp_final = m_i + torch.log(l_i_safe)
 
             O[:, q_start:q_end, :] = O_i_final.to(dtype_out)
-            L[:, q_start:q_end] = L_i_final
+            L[:, q_start:q_end] = logsumexp_final
         
         ctx.save_for_backward(Q, K, V, O, L)
         ctx.scale = scale
