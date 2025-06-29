@@ -9,9 +9,9 @@ class FlashAttentionPytorch(torch.autograd.Function):
         is_causal: whether to apply causal mask
         """
         Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
-        B, N_q, D = Q.shape
-        B, N_k, D = K.shape
-        B, N_v, D = V.shape
+        B, N_q, Dim = Q.shape
+        B, N_k, Dim = K.shape
+        B, N_v, Dim = V.shape
         
         dtype_acc = torch.float32
         dtype_out = Q.dtype
@@ -24,7 +24,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
 
         O = torch.zeros_like(Q)
         L = torch.zeros((B, N_q), dtype=dtype_acc, device=Q.device)
-        scale = 1.0 / D**0.5
+        scale = 1.0 / Dim**0.5
 
         for i in range(T_q):
             q_start = i * Q_TILE_SIZE
@@ -32,7 +32,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
             q_tile_size = q_end - q_start
 
             # O_i is the output of the i-th query tile (B, q_tile_size, D)
-            O_i = torch.zeros((B, q_tile_size, D), dtype=dtype_acc, device=Q.device)
+            O_i = torch.zeros((B, q_tile_size, Dim), dtype=dtype_acc, device=Q.device)
             # l_i is the row-wise sum of S_ij (B, q_tile_size)
             l_i = torch.zeros((B, q_tile_size), dtype=dtype_acc, device=Q.device)
             # m_i is the row-wise max of S_ij (B, q_tile_size)
@@ -84,10 +84,71 @@ class FlashAttentionPytorch(torch.autograd.Function):
 
     
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, dO):
         """
-        grad_output: (batch_size, num_heads, seq_len, head_dim)
+        dO: (batch_size, q_len, d_model)
         """
-        NotImplementedError("Backward pass not implemented")
+        Q, K, V, O, L = ctx.saved_tensors
+        scale = ctx.scale
+        is_causal = ctx.is_causal
         
+        B, N_q, Dim = Q.shape
+        B, N_k, Dim = K.shape
+        B, N_v, Dim = V.shape
+
+        dtype_acc = torch.float32
+        dtype_out = Q.dtype
+
+        Q_TILE_SIZE = 64
+        K_TILE_SIZE = 64
+
+        T_q = (N_q + Q_TILE_SIZE - 1) // Q_TILE_SIZE
+        T_k = (N_k + K_TILE_SIZE - 1) // K_TILE_SIZE
+
+        dQ = torch.zeros_like(Q)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
+        D = torch.sum(dO * O, dim=-1) # （B, N_q,)
         
+        for j in range(T_k):
+            k_start = j * K_TILE_SIZE
+            k_end = min(k_start + K_TILE_SIZE, N_k)
+            k_tile_size = k_end - k_start
+
+            K_tile = K[:, k_start:k_end, :].to(dtype_acc)
+            V_tile = V[:, k_start:k_end, :].to(dtype_acc)
+
+            dK_j = torch.zeros((B, k_tile_size, Dim), dtype=dtype_acc, device=Q.device)
+            dV_j = torch.zeros((B, k_tile_size, Dim), dtype=dtype_acc, device=Q.device)
+
+            for i in range(T_q):
+                q_start = i * Q_TILE_SIZE
+                q_end = min(q_start + Q_TILE_SIZE, N_q)
+                q_tile_size = q_end - q_start
+
+                Q_tile = Q[:, q_start:q_end, :].to(dtype_acc)
+                dO_i = dO[:, q_start:q_end, :].to(dtype_acc)
+                O_i = O[:, q_start:q_end, :].to(dtype_acc)
+                D_i = torch.sum(dO_i * O_i, dim=-1).to(dtype_acc)  # (B, q_tile_size)
+                L_tile = L[:, q_start:q_end].to(dtype_acc)
+
+                S_ij = Q_tile @ K_tile.transpose(-2, -1) * scale
+                if is_causal:
+                    mask = torch.triu(
+                        torch.ones(q_tile_size, k_tile_size, dtype=torch.bool, device=Q.device),
+                        diagonal=1
+                    )
+                    S_ij.masked_fill_(mask, -torch.inf)
+
+                P_ij = torch.exp(S_ij - L_tile.unsqueeze(-1))  # (B, q, k)
+                dP_ij = dO_i @ V_tile.transpose(-2, -1)        # (B, q, k)
+                dS_ij = P_ij * (dP_ij - D_i.unsqueeze(-1)) * scale
+
+                dQ[:, q_start:q_end, :] += (dS_ij @ K_tile).to(dtype_out)
+                dK_j += dS_ij.transpose(-2, -1) @ Q_tile
+                dV_j += P_ij.transpose(-2, -1) @ dO_i
+
+            dK[:, k_start:k_end, :] += dK_j.to(dtype_out)
+            dV[:, k_start:k_end, :] += dV_j.to(dtype_out)
+
+        return dQ, dK, dV, None
