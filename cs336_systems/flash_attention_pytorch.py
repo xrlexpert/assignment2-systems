@@ -93,8 +93,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
         is_causal = ctx.is_causal
         
         B, N_q, Dim = Q.shape
-        B, N_k, Dim = K.shape
-        B, N_v, Dim = V.shape
+        _, N_k, _ = K.shape
 
         dtype_acc = torch.float32
         dtype_out = Q.dtype
@@ -109,7 +108,19 @@ class FlashAttentionPytorch(torch.autograd.Function):
         dK = torch.zeros_like(K)
         dV = torch.zeros_like(V)
         D = torch.sum(dO * O, dim=-1) # （B, N_q,)
-        
+
+        # Traversal strategy comparison:
+        # Strategy 1: Outer loop over Q tiles, inner loop over K and V tiles
+        # - For each Q_i, we iterate over all K_j and V_j
+        # - Each K_j and V_j is repeatedly loaded for every Q_i  
+        # - Inner loop writes to dK_j and dV_j
+        # - Total memory access: high, due to frequent reloading of K and V
+
+        # Strategy 2: Outer loop over K and V tiles, inner loop over Q tiles
+        # - For each K_j and V_j, we iterate over all Q_i
+        # - Each Q_i is reused within the inner loop 
+        # - Inner loop writes to dQ_i, 
+        # - Total memory access: lower, innor loop only write to dQ (one) instead of dK and dV(two)
         for j in range(T_k):
             k_start = j * K_TILE_SIZE
             k_end = min(k_start + K_TILE_SIZE, N_k)
