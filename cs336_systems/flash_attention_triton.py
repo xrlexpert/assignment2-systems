@@ -1,7 +1,7 @@
 import torch
 import triton
 import triton.language as tl
-
+from einops import rearrange
 
 @triton.jit
 def flash_fwd_kernel(
@@ -111,10 +111,10 @@ def flash_fwd_kernel(
 
     l_acc = tl.where(l_acc == 0.0, 1.0, l_acc)
     l_inverse = 1.0 / l_acc
-    o_acc = o_acc * l_inverse[:, None].to(O_ptr.type.element_ty)
+    o_acc = o_acc * l_inverse[:, None]
     logsumexp = m_acc + tl.log(l_acc)
 
-    tl.store(O_block_ptr, o_acc, boundary_check=(0, 1))
+    tl.store(O_block_ptr, o_acc.to(O_ptr.type.element_ty), boundary_check=(0, 1))
     tl.store(L_block_ptr, logsumexp, boundary_check=(0,))
 
 @triton.jit
@@ -257,21 +257,45 @@ def flash_bwd_kernel(
         L_block_ptr = tl.advance(L_block_ptr, (Q_TILE_SIZE,))
         D_block_ptr = tl.advance(D_block_ptr, (Q_TILE_SIZE,))
     
-    tl.store(dK_block_ptr, dK_acc.to(K_ptr.type.element_ty), boundary_check=(0, 1))
-    tl.store(dV_block_ptr, dV_acc.to(V_ptr.type.element_ty), boundary_check=(0, 1))
+    tl.store(dK_block_ptr, dK_acc.to(dK_ptr.type.element_ty), boundary_check=(0, 1))
+    tl.store(dV_block_ptr, dV_acc.to(dV_ptr.type.element_ty), boundary_check=(0, 1))
+
+
+def get_tile_sizes(seq_len: int, dtype: torch.dtype):
+    if dtype == torch.float32:
+        max_tile = 64  
+    else:
+        max_tile = 64  
+
+    if seq_len <= 1024:
+        tile = 64
+    else:
+        tile = min(64, max_tile)
+    return tile
 
 class FlashAttentionTriton(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q, K, V, is_causal=False, q_tile_size=64, k_tile_size=64):
+    def forward(ctx, Q, K, V, is_causal=False):
+        # Q, K, V are (..., n_q, d)
         Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
-        B, N_q, Dim = Q.shape
-        _, N_k, _ = K.shape
+        batch_dims, N_q, Dim = Q.shape[:-2], Q.shape[-2], Q.shape[-1]
+        N_k = K.shape[-2]
+        N_v = V.shape[-2]
+        assert N_k == N_v, "K and V must have the same number of keys"
+
+        Q = rearrange(Q, "... n_q d -> (...) n_q d")
+        K = rearrange(K, "... n_k d -> (...) n_k d")
+        V = rearrange(V, "... n_v d -> (...) n_v d")
+        B = Q.shape[0]
 
 
         scale = 1.0/ (Dim**0.5)
 
-        O = torch.zeros_like(Q)
+        O = torch.zeros_like(Q, device=Q.device, dtype=torch.float32)
         L = torch.zeros((B, N_q,), device=Q.device, dtype=torch.float32)
+
+        q_tile_size = get_tile_sizes(N_q, Q.dtype)
+        k_tile_size = get_tile_sizes(N_k, K.dtype)
 
         grid = ((N_q + q_tile_size - 1) // q_tile_size, B)
 
@@ -293,7 +317,8 @@ class FlashAttentionTriton(torch.autograd.Function):
         ctx.save_for_backward(Q, K, V, O, L)
         ctx.is_causal = is_causal
         ctx.scale = scale
-
+        ctx.batch_dims = batch_dims
+        O = O.reshape(*batch_dims, N_q, Dim)
         return O
     
     @staticmethod
@@ -303,22 +328,25 @@ class FlashAttentionTriton(torch.autograd.Function):
         Q, K, V, O, L = ctx.saved_tensors
         scale = ctx.scale
         is_causal = ctx.is_causal
-        
-        B, N_q, Dim = dO.shape
+        batch_dims = ctx.batch_dims
+
+        B, N_q, Dim = Q.shape
         _, N_k, _ = K.shape
+
 
         device = Q.device
         detype = Q.dtype
 
-
-        dQ = torch.zeros_like(Q, device=device)
-        dK = torch.zeros_like(K, device=device)
-        dV = torch.zeros_like(V, device=device)
+        dO = dO.reshape(-1, N_q, Dim)
+        dQ = torch.zeros_like(Q, device=device, dtype=torch.float32)
+        dK = torch.zeros_like(K, device=device, dtype=torch.float32)
+        dV = torch.zeros_like(V, device=device, dtype=torch.float32)
         D = torch.sum(dO*O, dim=-1)
 
-        Q_tile_size = 64
-        K_tile_size = 64
-        grid = ((N_k + K_tile_size - 1) // K_tile_size, B)
+        q_tile_size = get_tile_sizes(N_q, Q.dtype)
+        k_tile_size = get_tile_sizes(N_k, K.dtype)
+
+        grid = ((N_k + k_tile_size - 1) // k_tile_size, B)
         flash_bwd_kernel[grid](
             Q,K,V,L,D,
             dQ, dK, dV, dO,
@@ -335,10 +363,13 @@ class FlashAttentionTriton(torch.autograd.Function):
             scale=scale,
             Dim=Dim,
             is_causal=is_causal,
-            Q_TILE_SIZE=Q_tile_size,
-            K_TILE_SIZE=K_tile_size
+            Q_TILE_SIZE=q_tile_size,
+            K_TILE_SIZE=k_tile_size
         )
 
+        dQ = dQ.reshape(*batch_dims, N_q, Dim).to(Q.dtype)
+        dK = dK.reshape(*batch_dims, N_k, Dim).to(K.dtype)
+        dV = dV.reshape(*batch_dims, N_k, Dim).to(V.dtype)
         return dQ, dK, dV, None
 
 
