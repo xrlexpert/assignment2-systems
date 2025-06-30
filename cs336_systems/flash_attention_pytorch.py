@@ -139,9 +139,8 @@ class FlashAttentionPytorch(torch.autograd.Function):
 
                 Q_tile = Q[:, q_start:q_end, :].to(dtype_acc)
                 dO_i = dO[:, q_start:q_end, :].to(dtype_acc)
-                O_i = O[:, q_start:q_end, :].to(dtype_acc)
-                D_i = torch.sum(dO_i * O_i, dim=-1).to(dtype_acc)  # (B, q_tile_size)
-                L_tile = L[:, q_start:q_end].to(dtype_acc)
+                D_i = D[:, q_start:q_end].to(dtype_acc)  # (B, q_tile_size)
+                L_i = L[:, q_start:q_end].to(dtype_acc)
 
                 S_ij = Q_tile @ K_tile.transpose(-2, -1) * scale
                 if is_causal:
@@ -151,7 +150,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
                     )
                     S_ij.masked_fill_(mask, -torch.inf)
 
-                P_ij = torch.exp(S_ij - L_tile.unsqueeze(-1))  # (B, q, k)
+                P_ij = torch.exp(S_ij - L_i.unsqueeze(-1))  # (B, q, k)
                 dP_ij = dO_i @ V_tile.transpose(-2, -1)        # (B, q, k)
                 dS_ij = P_ij * (dP_ij - D_i.unsqueeze(-1)) * scale
 
